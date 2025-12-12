@@ -1,0 +1,54 @@
+
+1.先运行calib_json2colmap.py把json标定文件转换成colmap格式
+python calib_json2colmap.py --calib people/calib.json --images_dir people/images
+
+2.接着将txt格式的模型转换为bin格式
+mkdir -p sparse_bin
+colmap model_converter     --input_path people/sparse_txt     --output_path people/sparse_bin     --output_type BIN
+
+3.然后进行图像去畸变
+colmap image_undistorter \
+--image_path ./images \
+--input_path ./manual_input \
+--output_path ./workspace \
+--output_type COLMAP
+
+4.运行cfg.py生成配置文件
+python cfg.py --workspace ./workspace --output ./workspace/config.txt
+
+5.最后运行patch_match_stereo进行稠密重建
+colmap patch_match_stereo \
+    --workspace_path ./workspace \
+    --workspace_format COLMAP \
+    --PatchMatchStereo.geom_consistency true
+
+6.运行fuser融合点云
+colmap stereo_fusion \
+    --workspace_path people/ \
+    --workspace_format COLMAP \
+    --input_type geometric \
+    --output_path people/fused.ply \
+    --StereoFusion.check_num_images 2  \
+    --StereoFusion.min_num_pixels 3
+--StereoFusion.check_num_images 2: 只要 2张 图片看到这个点就保留（默认是3）。
+--StereoFusion.min_num_pixels 3: 降低对像素一致性的要求（默认是5）。
+
+文件下内容：
+workspace/
+    input/
+    images/
+    sparse/
+        cameras.txt
+        images.txt
+        points3D.txt
+    stereo/
+        patch_match.cfg
+
+特征提取命令：
+colmap feature_extractor \
+   --database_path database.db \
+   --image_path images
+
+特征匹配命令：
+colmap exhaustive_matcher \
+   --database_path database.db

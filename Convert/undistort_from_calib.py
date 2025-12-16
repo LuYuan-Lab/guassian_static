@@ -87,6 +87,35 @@ def scale_intrinsics(K: np.ndarray, from_size: Tuple[int, int], to_size: Tuple[i
     return K_scaled
 
 
+def undistort_image_unified(img: np.ndarray, K: np.ndarray, dist: np.ndarray, unified_K: np.ndarray, scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
+    """Undistort image using original intrinsics but output to unified intrinsics"""
+    h, w = img.shape[:2]
+    
+    # Check if there's actually any distortion to correct
+    has_distortion = np.any(np.abs(dist) > 1e-6)
+    
+    if not has_distortion:
+        # No distortion - just apply optional scale to the unified K matrix
+        new_K = unified_K.copy()
+        if scale != 1.0:
+            new_K[0, 0] *= scale
+            new_K[1, 1] *= scale
+            new_K[0, 2] *= scale
+            new_K[1, 2] *= scale
+        return img.copy(), new_K
+    else:
+        # Has distortion - perform undistortion with unified target intrinsics
+        new_K = unified_K.copy()
+        if scale != 1.0:
+            new_K[0, 0] *= scale
+            new_K[1, 1] *= scale
+            new_K[0, 2] *= scale
+            new_K[1, 2] *= scale
+        map1, map2 = cv2.initUndistortRectifyMap(K, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
+        undist = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
+        return undist, new_K
+
+
 def undistort_image(img: np.ndarray, K: np.ndarray, dist: np.ndarray, scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
     h, w = img.shape[:2]
     
@@ -130,12 +159,13 @@ def str2bool(v):
 
 def main():
     ap = argparse.ArgumentParser(description='Undistort images using calib.json intrinsics (w2c extrinsics ignored).')
-    ap.add_argument('--calib', type=str, default='calib.json', help='Path to calib.json')
-    ap.add_argument('--images_dir', type=str, default='data/2-r', help='Input images directory')
-    ap.add_argument('--output_dir', type=str, default='data/undistorted', help='Output directory for undistorted images')
+    ap.add_argument('--calib', type=str, default='calib_0.5052.json', help='Path to calib.json')
+    ap.add_argument('--images_dir', type=str, default='output/binary_masks', help='Input images directory')
+    ap.add_argument('--output_dir', type=str, default='output/undistorted_binary_masks', help='Output directory for undistorted images')
     ap.add_argument('--pattern', type=str, default='*.png', help='Glob pattern for images')
     ap.add_argument('--scale', type=float, default=1.0, help='Optional scale factor applied to new camera matrix')
     ap.add_argument('--preserve_alpha', type=str2bool, default=True, help='Preserve and remap alpha channel if present (PNG with transparency)')
+    ap.add_argument('--unify_intrinsics', type=str2bool, default=True, help='Use unified average intrinsics for all cameras')
     args = ap.parse_args()
 
     with open(args.calib, 'r') as f:
@@ -157,6 +187,25 @@ def main():
     # If count matches, map 1:1; else use the first camera intrinsics for all
     per_cam = len(img_paths) == len(cams)
 
+    # Calculate unified intrinsics if requested
+    unified_intrinsics = None
+    if args.unify_intrinsics:
+        print("Computing unified intrinsics from all cameras...")
+        fx_list, fy_list, cx_list, cy_list = [], [], [], []
+        for cam in cams:
+            (fx, fy), (cx, cy), _, _ = extract_intrinsics(cam)
+            fx_list.append(fx)
+            fy_list.append(fy)
+            cx_list.append(cx)
+            cy_list.append(cy)
+        
+        avg_fx = np.mean(fx_list)
+        avg_fy = np.mean(fy_list)
+        avg_cx = np.mean(cx_list)
+        avg_cy = np.mean(cy_list)
+        unified_intrinsics = (avg_fx, avg_fy, avg_cx, avg_cy)
+        print(f"Unified intrinsics: fx={avg_fx:.2f}, fy={avg_fy:.2f}, cx={avg_cx:.2f}, cy={avg_cy:.2f}")
+
     # collect new intrinsics per image
     undist_intrinsics = {}
 
@@ -171,17 +220,38 @@ def main():
         K = build_camera_matrix(fx, fy, cx, cy)
         h, w = img.shape[:2]
         K_scaled = scale_intrinsics(K, (w0, h0), (w, h))
-        # If alpha channel exists and user requested preservation, split and remap all channels
-        if args.preserve_alpha and img.ndim == 3 and img.shape[2] == 4:
-            bgr = img[:, :, :3]
-            alpha = img[:, :, 3]
-            undist_bgr, new_K = undistort_image(bgr, K_scaled, dist, scale=args.scale)
-            # Remap alpha with same maps for consistency - use the SAME new_K from BGR undistortion
-            map1, map2 = cv2.initUndistortRectifyMap(K_scaled, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
-            undist_alpha = cv2.remap(alpha, map1, map2, interpolation=cv2.INTER_NEAREST)
-            undist = np.dstack([undist_bgr, undist_alpha])
+        
+        # Choose undistortion method based on unify_intrinsics flag
+        if args.unify_intrinsics:
+            # Use unified intrinsics as target
+            unified_K = build_camera_matrix(*unified_intrinsics)
+            unified_K_scaled = scale_intrinsics(unified_K, (w0, h0), (w, h))
+            
+            # If alpha channel exists and user requested preservation, split and remap all channels
+            if args.preserve_alpha and img.ndim == 3 and img.shape[2] == 4:
+                bgr = img[:, :, :3]
+                alpha = img[:, :, 3]
+                undist_bgr, new_K = undistort_image_unified(bgr, K_scaled, dist, unified_K_scaled, scale=args.scale)
+                # Remap alpha with same maps for consistency - use the SAME new_K from BGR undistortion
+                map1, map2 = cv2.initUndistortRectifyMap(K_scaled, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
+                undist_alpha = cv2.remap(alpha, map1, map2, interpolation=cv2.INTER_NEAREST)
+                undist = np.dstack([undist_bgr, undist_alpha])
+            else:
+                undist, new_K = undistort_image_unified(img, K_scaled, dist, unified_K_scaled, scale=args.scale)
         else:
-            undist, new_K = undistort_image(img, K_scaled, dist, scale=args.scale)
+            # Use original per-camera undistortion logic
+            # If alpha channel exists and user requested preservation, split and remap all channels
+            if args.preserve_alpha and img.ndim == 3 and img.shape[2] == 4:
+                bgr = img[:, :, :3]
+                alpha = img[:, :, 3]
+                undist_bgr, new_K = undistort_image(bgr, K_scaled, dist, scale=args.scale)
+                # Remap alpha with same maps for consistency - use the SAME new_K from BGR undistortion
+                map1, map2 = cv2.initUndistortRectifyMap(K_scaled, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
+                undist_alpha = cv2.remap(alpha, map1, map2, interpolation=cv2.INTER_NEAREST)
+                undist = np.dstack([undist_bgr, undist_alpha])
+            else:
+                undist, new_K = undistort_image(img, K_scaled, dist, scale=args.scale)
+        
         out_path = Path(args.output_dir) / Path(img_path).name
         cv2.imwrite(str(out_path), undist)
         print(f'  - {Path(img_path).name} -> {out_path}')
@@ -228,9 +298,20 @@ def main():
         data = model.get('ptr_wrapper', {}).get('data', {})
         params = data.setdefault('parameters', {})
         
-        # Calculate aspect ratio from new intrinsics
-        new_fx = new_intr['fx']
-        new_fy = new_intr['fy']
+        # If unified intrinsics are used, all cameras get the same intrinsics
+        if args.unify_intrinsics:
+            # Use the unified intrinsics (should be the same for all images)
+            new_fx = new_intr['fx']
+            new_fy = new_intr['fy']
+            new_cx = new_intr['cx'] 
+            new_cy = new_intr['cy']
+        else:
+            # Use individual camera intrinsics
+            new_fx = new_intr['fx']
+            new_fy = new_intr['fy']
+            new_cx = new_intr['cx']
+            new_cy = new_intr['cy']
+        
         new_ar = new_fy / new_fx if new_fx > 0 else 1.0
         
         # Update intrinsics parameters - use f + ar format to preserve aspect ratio
@@ -238,8 +319,8 @@ def main():
         set_param(params, 'ar', new_ar)  # Set ar = fy/fx
         set_param(params, 'fx', new_fx)
         set_param(params, 'fy', new_fy)
-        set_param(params, 'cx', new_intr['cx'])
-        set_param(params, 'cy', new_intr['cy'])
+        set_param(params, 'cx', new_cx)
+        set_param(params, 'cy', new_cy)
         # Zero distortion (OpenCV k1,k2,p1,p2,k3)
         set_param(params, 'k1', 0.0)
         set_param(params, 'k2', 0.0)

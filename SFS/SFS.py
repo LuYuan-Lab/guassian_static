@@ -292,8 +292,8 @@ def save_point_cloud_with_attributes(points, normals=None, colors=None, filename
 # ================= 配置与运行 =================
 
 # 1. 设置路径
-json_file_path = "undistorted_pha_uniform/calib_uniform.json"  # 修改为你的实际 JSON 文件名
-mask_folder_path = "binary_masks"      # 存放 .png 掩码的文件夹
+json_file_path = "output/undistorted_binary_masks/calib_undistorted.json"  # 修改为你的实际 JSON 文件名
+mask_folder_path = "output/undistorted_binary_masks"      # 存放 .png 掩码的文件夹
 
 # 2. 设置体素空间 (Bounding Box)
 # 重要：请确认你的物体位于此范围内。
@@ -301,8 +301,8 @@ mask_folder_path = "binary_masks"      # 存放 .png 掩码的文件夹
 # 这里的 bounds 应该包含物体在世界坐标系中的位置。
 # 如果物体在世界原点 (0,0,0) 附近，请使用 [-0.5, 0.5] 之类的范围。
 bounds = [-0.4, 0.3,  # min_x, max_x
-          -0.2, 0.38,  # min_y, max_y
-          0.8, 1.1]  # min_z, max_z
+          -0.2, 0.2,  # min_y, max_y
+          0.95, 1.4]  # min_z, max_z
 
 # 3. 设置精度
 step_size = 0.005

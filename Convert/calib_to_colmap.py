@@ -39,7 +39,8 @@ def load_calibration(json_path):
         height = img_size_data['height']
         
         # 内参矩阵
-        f_val = params['f']['val']
+        fx = params['f']['val']
+        ar = params['ar']['val']
         cx = params['cx']['val']
         cy = params['cy']['val']
         
@@ -78,7 +79,8 @@ def load_calibration(json_path):
             'camera_id': i + 1,  # COLMAP相机ID从1开始
             'width': width,
             'height': height,
-            'f': f_val,
+            'fx': fx,
+            'fy': fx * ar,
             'cx': cx,
             'cy': cy,
             'k1': k1,
@@ -138,7 +140,7 @@ def write_cameras_txt(cameras_data, output_file):
     # Number of cameras: N
     
     对于OPENCV相机模型：
-    CAMERA_ID, OPENCV, WIDTH, HEIGHT, fx, fy, cx, cy, k1, k2, p1, p2
+    CAMERA_ID, OPENCV, WIDTH, HEIGHT, PARAMS[]
     """
     with open(output_file, 'w') as f:
         # 写入头部注释
@@ -154,8 +156,8 @@ def write_cameras_txt(cameras_data, output_file):
                 cam['camera_id'],
                 cam['width'],
                 cam['height'],
-                cam['f'],     # fx
-                cam['f'],     # fy (假设fx=fy)
+                cam['fx'],     # fx
+                cam['fy'],     # fy
                 cam['cx'],
                 cam['cy'],
                 cam['k1'],
@@ -251,13 +253,16 @@ def create_colmap_database_info(cameras_data, output_dir):
         f.write("\n=== 相机参数统计 ===\n")
         
         # 统计相机参数
-        focal_lengths = [cam['f'] for cam in cameras_data]
+        fx_list = [cam['fx'] for cam in cameras_data]
+        fy_list = [cam['fy'] for cam in cameras_data]
         widths = [cam['width'] for cam in cameras_data]
         heights = [cam['height'] for cam in cameras_data]
         
         f.write(f"图像分辨率: {widths[0]}x{heights[0]}\n")
-        f.write(f"焦距范围: [{min(focal_lengths):.2f}, {max(focal_lengths):.2f}]\n")
-        f.write(f"焦距均值: {np.mean(focal_lengths):.2f}\n")
+        f.write(f"fx范围: [{min(fx_list):.2f}, {max(fx_list):.2f}]\n")
+        f.write(f"fx均值: {np.mean(fx_list):.2f}\n")
+        f.write(f"fy范围: [{min(fy_list):.2f}, {max(fy_list):.2f}]\n")
+        f.write(f"fy均值: {np.mean(fy_list):.2f}\n")
         
         # 相机位置统计
         positions = np.array([cam['t_c2w'] for cam in cameras_data])
@@ -335,10 +340,10 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='将calib_uniform.json转换为COLMAP格式')
     parser.add_argument('--calib', type=str, 
-                       default='undistorted_pha_uniform/calib_uniform.json',
+                       default='output/undistorted/calib_undistorted.json',
                        help='相机标定文件路径')
     parser.add_argument('--images', type=str, 
-                       default='undistorted_pha_uniform/rectified',
+                       default='output/undistorted',
                        help='图像目录路径')
     parser.add_argument('--output', type=str, default='colmap_sparse',
                        help='输出目录')

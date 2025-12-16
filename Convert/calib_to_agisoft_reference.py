@@ -89,8 +89,8 @@ def rodrigues_to_transform_matrix(rx, ry, rz, tx, ty, tz):
 
 def main():
     parser = argparse.ArgumentParser(description="将 calib.json 转换为 Agisoft camera.xml 格式")
-    parser.add_argument("--input", type=Path, default="trans//calib_ar.json", help="输入的 calib.json 文件路径")
-    parser.add_argument("--output", type=Path, default="camera_agisoft_generated.xml", help="输出的 XML 文件路径")
+    parser.add_argument("--input", type=Path, default="undistorted_img/calib_undistorted.json", help="输入的 calib.json 文件路径")
+    parser.add_argument("--output", type=Path, default="undistorted_img/camera_agisoft_generated.xml", help="输出的 XML 文件路径")
     args = parser.parse_args()
 
     # 加载 calib.json

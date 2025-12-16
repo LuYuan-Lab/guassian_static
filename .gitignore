@@ -4,3 +4,4 @@ SFS/undistorted_pha_uniform/*
 SFS/reconstruction.ply
 SFS/surface_only.ply
 SFS/projections/*
+output/*

@@ -14,7 +14,7 @@
     --xml images/2.0/cameras.xml \
     --images_dir images/2.0/No_Glasses \
     --output_dir images/2.0/No_Glasses_undistorted_3dgs \
-    [--output_xml images/2.0/cameras_undistorted.xml]
+    --unified_intrinsics False \
 
 作者: GitHub Copilot
 """
@@ -592,6 +592,8 @@ def main():
                         help='图像文件匹配模式（默认: *.png）')
     parser.add_argument('--unified_roi', type=bool, default=True,
                         help='是否使用统一的ROI裁切所有图像（推荐，默认: True）')
+    parser.add_argument('--unified_intrinsics', type=bool, default=True,
+                        help='是否使用统一的相机内参（True: 1个相机，False: 每图1个相机，默认: True）')
     parser.add_argument('--export_colmap', type=bool, default=True,
                         help='是否导出COLMAP格式的相机参数（默认: True）')
     
@@ -673,8 +675,10 @@ def main():
         if new_size is None:
             new_size = (undist_img.shape[1], undist_img.shape[0])
         
-        # 保存图像
-        output_path = os.path.join(args.output_dir, Path(img_path).name)
+        # 保存图像到 images/ 子目录
+        images_output_dir = os.path.join(args.output_dir, 'images')
+        os.makedirs(images_output_dir, exist_ok=True)
+        output_path = os.path.join(images_output_dir, Path(img_path).name)
         cv2.imwrite(output_path, undist_img)
         
         # 记录相机信息
@@ -698,11 +702,14 @@ def main():
     if new_size:
         print(f"输出图像尺寸: {new_size[0]} x {new_size[1]}")
     
-    # 导出COLMAP格式
+    # 导出COLMAP格式 (标准3DGS目录结构: sparse/0/)
+    # use_unified_intrinsics=True: 所有图像共享1个相机内参（推荐，适用于同一相机拍摄）
+    # use_unified_intrinsics=False: 每张图像单独的相机内参
     if args.export_colmap and cameras_info:
-        colmap_dir = os.path.join(args.output_dir, 'colmap_sparse')
-        export_colmap_cameras(colmap_dir, cameras_info, use_unified_intrinsics=True)
-        export_colmap_images(colmap_dir, cameras_info, cameras, use_unified_intrinsics=True)
+        colmap_dir = os.path.join(args.output_dir, 'sparse', '0')
+        use_unified = args.unified_intrinsics
+        export_colmap_cameras(colmap_dir, cameras_info, use_unified_intrinsics=use_unified)
+        export_colmap_images(colmap_dir, cameras_info, cameras, use_unified_intrinsics=use_unified)
         export_colmap_points3d(colmap_dir)
     
     # 更新XML

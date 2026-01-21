@@ -340,10 +340,10 @@ def main():
     """主函数"""
     parser = argparse.ArgumentParser(description='将calib_uniform.json转换为COLMAP格式')
     parser.add_argument('--calib', type=str, 
-                       default='output/undistorted/calib_undistorted.json',
+                       default='output\\calib_undistorted.json',
                        help='相机标定文件路径')
     parser.add_argument('--images', type=str, 
-                       default='output/undistorted',
+                       default='output',
                        help='图像目录路径')
     parser.add_argument('--output', type=str, default='colmap_sparse',
                        help='输出目录')

@@ -1,22 +1,18 @@
 #!/usr/bin/env python3
 """
-Undistort images using intrinsics from calib.json (libCalib format).
-Assumes calib.json extrinsics are world-to-camera (w2c), but undistortion uses intrinsics only.
+使用pycolmap对libCalib格式的calib.json进行图像去畸变
 
-Usage:
+特点:
+- 使用FULL_OPENCV模型包含k3参数，避免鱼眼效果
+- 自动裁剪使主点居中（3DGS训练要求）
+- 统一所有图像尺寸
+- 输出COLMAP格式（PINHOLE模型，无畸变）
+
+使用方法:
   python undistort_from_calib.py \
-    --calib people4/calib.json \
-    --images_dir people4/1-r \
-    --output_dir people4/undistorted \
-    [--pattern "*.png"] [--scale 1.0]
-
-Notes:
-- Reads fx, fy (or f & ar), cx, cy, and distortion (k1,k2,k3,k4,k5,k6,p1,p2) per camera entry.
-- Uses OpenCV's standard pinhole distortion model: [k1,k2,p1,p2,k3].
-- Higher-order k4..k6 are ignored by cv2.undistort.
-- If image dimensions differ from the intrinsics' recorded width/height, we scale fx,fy,cx,cy accordingly.
-
-If you need rectification to a common plane using extrinsics, that's a separate step.
+    --calib calib.json \
+    --images_dir images \
+    --output_dir undistorted
 """
 
 import argparse
@@ -24,15 +20,25 @@ import json
 import os
 from pathlib import Path
 import glob
-from typing import Dict, Any, Tuple
-import copy
-
-import cv2
+from typing import Dict, Any, Tuple, List, Optional
+import shutil
 import numpy as np
+import cv2
+
+try:
+    import pycolmap
+    HAS_PYCOLMAP = True
+except ImportError:
+    HAS_PYCOLMAP = False
+    print("警告: pycolmap未安装，请运行 pip install pycolmap")
 
 
-def extract_intrinsics(cam_entry: Dict[str, Any]) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], np.ndarray]:
-    """Extract (fx, fy), (cx, cy), (width, height), dist_coeffs from a camera entry."""
+# =============================================================================
+# Calib.json 解析
+# =============================================================================
+
+def extract_intrinsics(cam_entry: Dict[str, Any]) -> Tuple[Tuple[float, float], Tuple[float, float], Tuple[int, int], Dict[str, float]]:
+    """从相机条目提取内参 (fx, fy), (cx, cy), (width, height), dist_coeffs"""
     model = cam_entry.get('model', {})
     data = model.get('ptr_wrapper', {}).get('data', {})
     params = data.get('parameters', {})
@@ -49,303 +55,534 @@ def extract_intrinsics(cam_entry: Dict[str, Any]) -> Tuple[Tuple[float, float], 
     cx = float(params.get('cx', {}).get('val', 0.0))
     cy = float(params.get('cy', {}).get('val', 0.0))
 
-    # Validate intrinsics
-    if fx <= 0 or fy <= 0:
-        raise ValueError(f"Invalid focal length: fx={fx}, fy={fy}. Must be positive.")
-    if cx < 0 or cy < 0:
-        print(f"[WARN] Negative principal point: cx={cx}, cy={cy}")
-
-    # Distortion coefficients
-    k1 = float(params.get('k1', {}).get('val', 0.0))
-    k2 = float(params.get('k2', {}).get('val', 0.0))
-    p1 = float(params.get('p1', {}).get('val', 0.0))
-    p2 = float(params.get('p2', {}).get('val', 0.0))
-    k3 = float(params.get('k3', {}).get('val', 0.0))
-    # OpenCV standard undistort uses only first 5; k4..k6 ignored here
-    dist = np.array([k1, k2, p1, p2, k3], dtype=np.float64)
+    # 畸变系数
+    dist = {
+        'k1': float(params.get('k1', {}).get('val', 0.0)),
+        'k2': float(params.get('k2', {}).get('val', 0.0)),
+        'k3': float(params.get('k3', {}).get('val', 0.0)),
+        'k4': float(params.get('k4', {}).get('val', 0.0)),
+        'p1': float(params.get('p1', {}).get('val', 0.0)),
+        'p2': float(params.get('p2', {}).get('val', 0.0)),
+    }
+    
     return (fx, fy), (cx, cy), (width, height), dist
 
 
-def build_camera_matrix(fx: float, fy: float, cx: float, cy: float) -> np.ndarray:
-    K = np.array([[fx, 0, cx], [0, fy, cy], [0, 0, 1]], dtype=np.float64)
-    return K
-
-
-def scale_intrinsics(K: np.ndarray, from_size: Tuple[int, int], to_size: Tuple[int, int]) -> np.ndarray:
-    """Scale K if image resolution differs from the one stored in calib."""
-    w0, h0 = from_size
-    w1, h1 = to_size
-    if w0 == 0 or h0 == 0 or (w0 == w1 and h0 == h1):
-        return K.copy()
-    sx = w1 / w0
-    sy = h1 / h0
-    K_scaled = K.copy()
-    K_scaled[0, 0] *= sx
-    K_scaled[1, 1] *= sy
-    K_scaled[0, 2] *= sx
-    K_scaled[1, 2] *= sy
-    return K_scaled
-
-
-def undistort_image_unified(img: np.ndarray, K: np.ndarray, dist: np.ndarray, unified_K: np.ndarray, scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    """Undistort image using original intrinsics but output to unified intrinsics"""
-    h, w = img.shape[:2]
+def extract_extrinsics(cam_entry: Dict[str, Any]) -> Optional[np.ndarray]:
+    """从相机条目提取外参（4x4变换矩阵，world-to-camera）"""
+    model = cam_entry.get('model', {})
+    data = model.get('ptr_wrapper', {}).get('data', {})
+    pose = data.get('pose', {})
     
-    # Check if there's actually any distortion to correct
-    has_distortion = np.any(np.abs(dist) > 1e-6)
+    # 尝试获取旋转和平移
+    rotation = pose.get('rotation', {})
+    translation = pose.get('translation', {})
     
-    if not has_distortion:
-        # No distortion - just apply optional scale to the unified K matrix
-        new_K = unified_K.copy()
-        if scale != 1.0:
-            new_K[0, 0] *= scale
-            new_K[1, 1] *= scale
-            new_K[0, 2] *= scale
-            new_K[1, 2] *= scale
-        return img.copy(), new_K
+    if not rotation or not translation:
+        return None
+    
+    # 旋转可能是四元数或旋转矩阵
+    if 'w' in rotation:
+        # 四元数格式 (w, x, y, z)
+        qw = rotation.get('w', 1.0)
+        qx = rotation.get('x', 0.0)
+        qy = rotation.get('y', 0.0)
+        qz = rotation.get('z', 0.0)
+        R = quaternion_to_rotation_matrix(qw, qx, qy, qz)
+    elif 'data' in rotation:
+        # 旋转矩阵格式
+        R = np.array(rotation['data']).reshape(3, 3)
     else:
-        # Has distortion - perform undistortion with unified target intrinsics
-        new_K = unified_K.copy()
-        if scale != 1.0:
-            new_K[0, 0] *= scale
-            new_K[1, 1] *= scale
-            new_K[0, 2] *= scale
-            new_K[1, 2] *= scale
-        map1, map2 = cv2.initUndistortRectifyMap(K, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
-        undist = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-        return undist, new_K
-
-
-def undistort_image(img: np.ndarray, K: np.ndarray, dist: np.ndarray, scale: float = 1.0) -> Tuple[np.ndarray, np.ndarray]:
-    h, w = img.shape[:2]
+        return None
     
-    # Check if there's actually any distortion to correct
-    has_distortion = np.any(np.abs(dist) > 1e-6)
+    # 平移
+    if 'data' in translation:
+        t = np.array(translation['data']).reshape(3)
+    elif 'x' in translation:
+        t = np.array([translation['x'], translation['y'], translation['z']])
+    else:
+        return None
     
-    if not has_distortion:
-        # No distortion - just apply optional scale to the original K matrix
-        new_K = K.copy()
-        if scale != 1.0:
-            new_K[0, 0] *= scale
-            new_K[1, 1] *= scale
-            new_K[0, 2] *= scale
-            new_K[1, 2] *= scale
-        return img.copy(), new_K
-    else:
-        # Has distortion - perform actual undistortion
-        new_K, _ = cv2.getOptimalNewCameraMatrix(K, dist, (w, h), alpha=0)
-        if scale != 1.0:
-            new_K = new_K.copy()
-            new_K[0, 0] *= scale
-            new_K[1, 1] *= scale
-            new_K[0, 2] *= scale
-            new_K[1, 2] *= scale
-        map1, map2 = cv2.initUndistortRectifyMap(K, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
-        undist = cv2.remap(img, map1, map2, interpolation=cv2.INTER_LINEAR)
-        return undist, new_K
-    return undist, new_K
+    # 构建4x4变换矩阵
+    T = np.eye(4)
+    T[:3, :3] = R
+    T[:3, 3] = t
+    
+    return T
 
 
-def str2bool(v):
-    """Convert string to boolean for argparse"""
-    if isinstance(v, bool):
-        return v
-    if v.lower() in ('yes', 'true', 't', 'y', '1'):
-        return True
-    elif v.lower() in ('no', 'false', 'f', 'n', '0'):
-        return False
+def quaternion_to_rotation_matrix(qw: float, qx: float, qy: float, qz: float) -> np.ndarray:
+    """四元数转旋转矩阵"""
+    # 归一化
+    n = np.sqrt(qw*qw + qx*qx + qy*qy + qz*qz)
+    if n < 1e-10:
+        return np.eye(3)
+    qw, qx, qy, qz = qw/n, qx/n, qy/n, qz/n
+    
+    R = np.array([
+        [1 - 2*(qy*qy + qz*qz), 2*(qx*qy - qz*qw), 2*(qx*qz + qy*qw)],
+        [2*(qx*qy + qz*qw), 1 - 2*(qx*qx + qz*qz), 2*(qy*qz - qx*qw)],
+        [2*(qx*qz - qy*qw), 2*(qy*qz + qx*qw), 1 - 2*(qx*qx + qy*qy)]
+    ])
+    return R
+
+
+def rotation_matrix_to_quaternion(R: np.ndarray) -> Tuple[float, float, float, float]:
+    """旋转矩阵转四元数"""
+    trace = R[0, 0] + R[1, 1] + R[2, 2]
+    
+    if trace > 0:
+        s = 0.5 / np.sqrt(trace + 1.0)
+        qw = 0.25 / s
+        qx = (R[2, 1] - R[1, 2]) * s
+        qy = (R[0, 2] - R[2, 0]) * s
+        qz = (R[1, 0] - R[0, 1]) * s
+    elif R[0, 0] > R[1, 1] and R[0, 0] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[0, 0] - R[1, 1] - R[2, 2])
+        qw = (R[2, 1] - R[1, 2]) / s
+        qx = 0.25 * s
+        qy = (R[0, 1] + R[1, 0]) / s
+        qz = (R[0, 2] + R[2, 0]) / s
+    elif R[1, 1] > R[2, 2]:
+        s = 2.0 * np.sqrt(1.0 + R[1, 1] - R[0, 0] - R[2, 2])
+        qw = (R[0, 2] - R[2, 0]) / s
+        qx = (R[0, 1] + R[1, 0]) / s
+        qy = 0.25 * s
+        qz = (R[1, 2] + R[2, 1]) / s
     else:
-        raise argparse.ArgumentTypeError('Boolean value expected.')
+        s = 2.0 * np.sqrt(1.0 + R[2, 2] - R[0, 0] - R[1, 1])
+        qw = (R[1, 0] - R[0, 1]) / s
+        qx = (R[0, 2] + R[2, 0]) / s
+        qy = (R[1, 2] + R[2, 1]) / s
+        qz = 0.25 * s
+    
+    return qw, qx, qy, qz
+
+
+# =============================================================================
+# COLMAP文件操作
+# =============================================================================
+
+def create_colmap_sparse(cameras_data: List[Dict], output_dir: str) -> str:
+    """创建COLMAP稀疏重建文件（文本格式，带畸变参数）"""
+    sparse_dir = os.path.join(output_dir, 'sparse')
+    os.makedirs(sparse_dir, exist_ok=True)
+    
+    # 写入cameras.txt（FULL_OPENCV模型，包含k3）
+    cameras_txt_path = os.path.join(sparse_dir, 'cameras.txt')
+    with open(cameras_txt_path, 'w') as f:
+        f.write("# Camera list with one line of data per camera:\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f.write(f"# Number of cameras: {len(cameras_data)}\n")
+        
+        for cam in cameras_data:
+            cam_id = cam['id']
+            width = cam['width']
+            height = cam['height']
+            fx, fy = cam['fx'], cam['fy']
+            cx, cy = cam['cx'], cam['cy']
+            dist = cam['dist']
+            
+            k1 = dist['k1']
+            k2 = dist['k2']
+            k3 = dist['k3']
+            k4 = dist.get('k4', 0.0)
+            p1 = dist['p1']
+            p2 = dist['p2']
+            k5, k6 = 0.0, 0.0
+            
+            # FULL_OPENCV模型: fx, fy, cx, cy, k1, k2, p1, p2, k3, k4, k5, k6
+            f.write(f"{cam_id} FULL_OPENCV {width} {height} "
+                    f"{fx:.10f} {fy:.10f} {cx:.10f} {cy:.10f} "
+                    f"{k1:.10f} {k2:.10f} {p1:.10f} {p2:.10f} "
+                    f"{k3:.10f} {k4:.10f} {k5:.10f} {k6:.10f}\n")
+    
+    # 写入images.txt
+    images_txt_path = os.path.join(sparse_dir, 'images.txt')
+    with open(images_txt_path, 'w') as f:
+        f.write("# Image list with two lines of data per image:\n")
+        f.write("#   IMAGE_ID, QW, QX, QY, QZ, TX, TY, TZ, CAMERA_ID, NAME\n")
+        f.write("#   POINTS2D[] as (X, Y, POINT3D_ID)\n")
+        f.write(f"# Number of registered images: {len(cameras_data)}\n")
+        
+        for cam in cameras_data:
+            cam_id = cam['id']
+            qw, qx, qy, qz = cam['quaternion']
+            tx, ty, tz = cam['translation']
+            img_name = cam['image_name']
+            
+            f.write(f"{cam_id} {qw:.10f} {qx:.10f} {qy:.10f} {qz:.10f} "
+                    f"{tx:.10f} {ty:.10f} {tz:.10f} {cam_id} {img_name}\n")
+            f.write("\n")
+    
+    # 写入空的points3D.txt
+    points3d_txt_path = os.path.join(sparse_dir, 'points3D.txt')
+    with open(points3d_txt_path, 'w') as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        f.write("# Number of points: 0\n")
+    
+    return sparse_dir
+
+
+def parse_cameras_txt(cameras_path: str) -> dict:
+    """解析cameras.txt文件"""
+    cameras = {}
+    with open(cameras_path, 'r') as f:
+        for line in f:
+            line = line.strip()
+            if line.startswith('#') or not line:
+                continue
+            parts = line.split()
+            cam_id = int(parts[0])
+            model = parts[1]
+            width = int(parts[2])
+            height = int(parts[3])
+            params = [float(p) for p in parts[4:]]
+            cameras[cam_id] = {
+                'model': model,
+                'width': width,
+                'height': height,
+                'params': params
+            }
+    return cameras
+
+
+def parse_images_txt(images_path: str) -> dict:
+    """解析images.txt文件"""
+    images = {}
+    with open(images_path, 'r') as f:
+        lines = f.readlines()
+    
+    i = 0
+    while i < len(lines):
+        line = lines[i].strip()
+        if line.startswith('#') or not line:
+            i += 1
+            continue
+        
+        parts = line.split()
+        if len(parts) >= 10:
+            img_id = int(parts[0])
+            qw, qx, qy, qz = float(parts[1]), float(parts[2]), float(parts[3]), float(parts[4])
+            tx, ty, tz = float(parts[5]), float(parts[6]), float(parts[7])
+            cam_id = int(parts[8])
+            name = parts[9]
+            
+            images[img_id] = {
+                'qw': qw, 'qx': qx, 'qy': qy, 'qz': qz,
+                'tx': tx, 'ty': ty, 'tz': tz,
+                'camera_id': cam_id,
+                'name': name
+            }
+            i += 2
+        else:
+            i += 1
+    
+    return images
+
+
+# =============================================================================
+# 主点居中处理
+# =============================================================================
+
+def compute_unified_crop(cameras: dict) -> Tuple[int, int, dict]:
+    """计算统一的裁剪参数，确保所有相机的主点都在中心"""
+    crop_info = {}
+    
+    for cam_id, cam in cameras.items():
+        width = cam['width']
+        height = cam['height']
+        params = cam['params']
+        
+        if cam['model'] == 'PINHOLE' and len(params) >= 4:
+            fx, fy, cx, cy = params[0], params[1], params[2], params[3]
+        else:
+            print(f"警告: Camera {cam_id} 模型 {cam['model']} 不支持")
+            continue
+        
+        left = cx
+        right = width - cx
+        top = cy
+        bottom = height - cy
+        
+        half_w = min(left, right)
+        half_h = min(top, bottom)
+        
+        crop_info[cam_id] = {
+            'new_width': int(2 * half_w),
+            'new_height': int(2 * half_h),
+            'fx': fx,
+            'fy': fy,
+            'old_cx': cx,
+            'old_cy': cy
+        }
+    
+    if not crop_info:
+        raise RuntimeError("没有有效的相机数据")
+    
+    min_width = min(c['new_width'] for c in crop_info.values())
+    min_height = min(c['new_height'] for c in crop_info.values())
+    
+    unified_width = min_width - (min_width % 2)
+    unified_height = min_height - (min_height % 2)
+    
+    for cam_id in crop_info:
+        cam = cameras[cam_id]
+        cx, cy = cam['params'][2], cam['params'][3]
+        
+        half_w = unified_width / 2
+        half_h = unified_height / 2
+        
+        crop_info[cam_id]['unified_width'] = unified_width
+        crop_info[cam_id]['unified_height'] = unified_height
+        crop_info[cam_id]['crop_x'] = int(cx - half_w)
+        crop_info[cam_id]['crop_y'] = int(cy - half_h)
+    
+    return unified_width, unified_height, crop_info
+
+
+def center_principal_point(undistorted_dir: str, output_dir: str) -> Tuple[int, int]:
+    """裁剪去畸变后的图像使主点居中"""
+    input_sparse = os.path.join(undistorted_dir, 'sparse')
+    input_images = os.path.join(undistorted_dir, 'images')
+    
+    # 如果是二进制格式，先转换
+    if os.path.exists(os.path.join(input_sparse, 'cameras.bin')):
+        print("  转换二进制格式到文本...")
+        rec = pycolmap.Reconstruction(input_sparse)
+        sparse_txt = os.path.join(undistorted_dir, 'sparse_txt')
+        os.makedirs(sparse_txt, exist_ok=True)
+        rec.write_text(sparse_txt)
+        input_sparse = sparse_txt
+    
+    cameras = parse_cameras_txt(os.path.join(input_sparse, 'cameras.txt'))
+    images = parse_images_txt(os.path.join(input_sparse, 'images.txt'))
+    
+    unified_width, unified_height, crop_info = compute_unified_crop(cameras)
+    print(f"  统一输出尺寸: {unified_width} x {unified_height}")
+    print(f"  主点位置: ({unified_width/2}, {unified_height/2}) [完全居中]")
+    
+    output_images = os.path.join(output_dir, 'images')
+    output_sparse = os.path.join(output_dir, 'sparse')
+    os.makedirs(output_images, exist_ok=True)
+    os.makedirs(output_sparse, exist_ok=True)
+    
+    print("  裁剪图像...")
+    for img_id, img_data in images.items():
+        cam_id = img_data['camera_id']
+        img_name = img_data['name']
+        
+        if cam_id not in crop_info:
+            continue
+        
+        crop = crop_info[cam_id]
+        img_path = os.path.join(input_images, img_name)
+        
+        if not os.path.exists(img_path):
+            continue
+        
+        img = cv2.imread(img_path)
+        if img is None:
+            continue
+        
+        h, w = img.shape[:2]
+        crop_x = max(0, min(crop['crop_x'], w - crop['unified_width']))
+        crop_y = max(0, min(crop['crop_y'], h - crop['unified_height']))
+        crop_w = crop['unified_width']
+        crop_h = crop['unified_height']
+        
+        cropped = img[crop_y:crop_y+crop_h, crop_x:crop_x+crop_w]
+        cv2.imwrite(os.path.join(output_images, img_name), cropped)
+    
+    # 写入cameras.txt（主点在中心）
+    with open(os.path.join(output_sparse, 'cameras.txt'), 'w') as f:
+        f.write("# Camera list with one line of data per camera:\n")
+        f.write("#   CAMERA_ID, MODEL, WIDTH, HEIGHT, PARAMS[]\n")
+        f.write(f"# Number of cameras: {len(cameras)}\n")
+        
+        for cam_id, cam in cameras.items():
+            if cam_id not in crop_info:
+                continue
+            fx = crop_info[cam_id]['fx']
+            fy = crop_info[cam_id]['fy']
+            cx = unified_width / 2.0
+            cy = unified_height / 2.0
+            f.write(f"{cam_id} PINHOLE {unified_width} {unified_height} "
+                    f"{fx:.10f} {fy:.10f} {cx:.10f} {cy:.10f}\n")
+    
+    # 复制images.txt
+    shutil.copy(os.path.join(input_sparse, 'images.txt'),
+                os.path.join(output_sparse, 'images.txt'))
+    
+    # 创建空的points3D.txt
+    with open(os.path.join(output_sparse, 'points3D.txt'), 'w') as f:
+        f.write("# 3D point list with one line of data per point:\n")
+        f.write("#   POINT3D_ID, X, Y, Z, R, G, B, ERROR, TRACK[] as (IMAGE_ID, POINT2D_IDX)\n")
+        f.write("# Number of points: 0\n")
+    
+    return unified_width, unified_height
+
+
+# =============================================================================
+# 主函数
+# =============================================================================
 
 def main():
-    ap = argparse.ArgumentParser(description='Undistort images using calib.json intrinsics (w2c extrinsics ignored).')
-    ap.add_argument('--calib', type=str, default='calib_0.5052.json', help='Path to calib.json')
-    ap.add_argument('--images_dir', type=str, default='output/binary_masks', help='Input images directory')
-    ap.add_argument('--output_dir', type=str, default='output/undistorted_binary_masks', help='Output directory for undistorted images')
-    ap.add_argument('--pattern', type=str, default='*.png', help='Glob pattern for images')
-    ap.add_argument('--scale', type=float, default=1.0, help='Optional scale factor applied to new camera matrix')
-    ap.add_argument('--preserve_alpha', type=str2bool, default=True, help='Preserve and remap alpha channel if present (PNG with transparency)')
-    ap.add_argument('--unify_intrinsics', type=str2bool, default=True, help='Use unified average intrinsics for all cameras')
-    args = ap.parse_args()
-
+    parser = argparse.ArgumentParser(
+        description='使用pycolmap对calib.json进行图像去畸变 - 用于3DGS训练',
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+示例:
+  python undistort_from_calib.py --calib calib.json --images_dir images --output_dir output
+        """)
+    parser.add_argument('--calib', type=str, required=True,
+                        help='calib.json文件路径')
+    parser.add_argument('--images_dir', type=str, required=True,
+                        help='原始图像目录')
+    parser.add_argument('--output_dir', type=str, required=True,
+                        help='输出目录')
+    parser.add_argument('--pattern', type=str, default='*.png',
+                        help='图像文件匹配模式 (默认: *.png)')
+    
+    args = parser.parse_args()
+    
+    if not HAS_PYCOLMAP:
+        print("错误: pycolmap未安装，请运行 pip install pycolmap")
+        return 1
+    
+    print("="*60)
+    print("Calib.json图像去畸变工具 (pycolmap)")
+    print("="*60)
+    
+    # 创建临时目录
+    temp_dir = os.path.join(args.output_dir, '_temp')
+    os.makedirs(temp_dir, exist_ok=True)
+    
+    # 步骤1: 解析calib.json
+    print(f"\n[1/4] 解析calib.json: {args.calib}")
     with open(args.calib, 'r') as f:
         calib = json.load(f)
-
+    
     cams = calib.get('Calibration', {}).get('cameras', [])
     if not cams:
-        raise RuntimeError('No cameras found in calib.json')
-
-    # Collect images
-    img_paths = sorted(glob.glob(str(Path(args.images_dir) / args.pattern)))
-    if not img_paths:
-        print(f'No images found in {args.images_dir} matching {args.pattern}')
-        return
-
-    os.makedirs(args.output_dir, exist_ok=True)
-    print(f'Found {len(img_paths)} images. Undistorting to {args.output_dir} ...')
-
-    # If count matches, map 1:1; else use the first camera intrinsics for all
-    per_cam = len(img_paths) == len(cams)
-
-    # Calculate unified intrinsics if requested
-    unified_intrinsics = None
-    if args.unify_intrinsics:
-        print("Computing unified intrinsics from all cameras...")
-        fx_list, fy_list, cx_list, cy_list = [], [], [], []
-        for cam in cams:
-            (fx, fy), (cx, cy), _, _ = extract_intrinsics(cam)
-            fx_list.append(fx)
-            fy_list.append(fy)
-            cx_list.append(cx)
-            cy_list.append(cy)
-        
-        avg_fx = np.mean(fx_list)
-        avg_fy = np.mean(fy_list)
-        avg_cx = np.mean(cx_list)
-        avg_cy = np.mean(cy_list)
-        unified_intrinsics = (avg_fx, avg_fy, avg_cx, avg_cy)
-        print(f"Unified intrinsics: fx={avg_fx:.2f}, fy={avg_fy:.2f}, cx={avg_cx:.2f}, cy={avg_cy:.2f}")
-
-    # collect new intrinsics per image
-    undist_intrinsics = {}
-
-    for i, img_path in enumerate(img_paths):
-        # Use UNCHANGED to keep alpha if present
-        img = cv2.imread(img_path, cv2.IMREAD_UNCHANGED)
-        if img is None:
-            print(f'[WARN] Failed to read {img_path}')
-            continue
+        raise RuntimeError('calib.json中未找到相机')
+    
+    print(f"  找到 {len(cams)} 个相机")
+    
+    # 步骤2: 查找图像并匹配相机
+    print(f"\n[2/4] 准备图像...")
+    image_paths = sorted(glob.glob(os.path.join(args.images_dir, args.pattern)))
+    if not image_paths:
+        for ext in ['*.jpg', '*.jpeg', '*.PNG', '*.JPG', '*.JPEG']:
+            image_paths = sorted(glob.glob(os.path.join(args.images_dir, ext)))
+            if image_paths:
+                break
+    
+    if not image_paths:
+        raise RuntimeError(f"在 {args.images_dir} 中未找到图像")
+    
+    print(f"  找到 {len(image_paths)} 张图像")
+    
+    # 准备图像目录
+    images_input_dir = os.path.join(temp_dir, 'images_input')
+    os.makedirs(images_input_dir, exist_ok=True)
+    
+    # 图像和相机一一对应
+    per_cam = len(image_paths) == len(cams)
+    
+    cameras_data = []
+    for i, img_path in enumerate(image_paths):
         cam_idx = i if per_cam else 0
-        (fx, fy), (cx, cy), (w0, h0), dist = extract_intrinsics(cams[cam_idx])
-        K = build_camera_matrix(fx, fy, cx, cy)
-        h, w = img.shape[:2]
-        K_scaled = scale_intrinsics(K, (w0, h0), (w, h))
+        cam_entry = cams[cam_idx]
         
-        # Choose undistortion method based on unify_intrinsics flag
-        if args.unify_intrinsics:
-            # Use unified intrinsics as target
-            unified_K = build_camera_matrix(*unified_intrinsics)
-            unified_K_scaled = scale_intrinsics(unified_K, (w0, h0), (w, h))
-            
-            # If alpha channel exists and user requested preservation, split and remap all channels
-            if args.preserve_alpha and img.ndim == 3 and img.shape[2] == 4:
-                bgr = img[:, :, :3]
-                alpha = img[:, :, 3]
-                undist_bgr, new_K = undistort_image_unified(bgr, K_scaled, dist, unified_K_scaled, scale=args.scale)
-                # Remap alpha with same maps for consistency - use the SAME new_K from BGR undistortion
-                map1, map2 = cv2.initUndistortRectifyMap(K_scaled, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
-                undist_alpha = cv2.remap(alpha, map1, map2, interpolation=cv2.INTER_NEAREST)
-                undist = np.dstack([undist_bgr, undist_alpha])
-            else:
-                undist, new_K = undistort_image_unified(img, K_scaled, dist, unified_K_scaled, scale=args.scale)
-        else:
-            # Use original per-camera undistortion logic
-            # If alpha channel exists and user requested preservation, split and remap all channels
-            if args.preserve_alpha and img.ndim == 3 and img.shape[2] == 4:
-                bgr = img[:, :, :3]
-                alpha = img[:, :, 3]
-                undist_bgr, new_K = undistort_image(bgr, K_scaled, dist, scale=args.scale)
-                # Remap alpha with same maps for consistency - use the SAME new_K from BGR undistortion
-                map1, map2 = cv2.initUndistortRectifyMap(K_scaled, dist, R=None, newCameraMatrix=new_K, size=(w, h), m1type=cv2.CV_32FC1)
-                undist_alpha = cv2.remap(alpha, map1, map2, interpolation=cv2.INTER_NEAREST)
-                undist = np.dstack([undist_bgr, undist_alpha])
-            else:
-                undist, new_K = undistort_image(img, K_scaled, dist, scale=args.scale)
+        # 提取内参
+        (fx, fy), (cx, cy), (w0, h0), dist = extract_intrinsics(cam_entry)
         
-        out_path = Path(args.output_dir) / Path(img_path).name
-        cv2.imwrite(str(out_path), undist)
-        print(f'  - {Path(img_path).name} -> {out_path}')
-
-        # record intrinsics for this image
-        fx_new = float(new_K[0, 0])
-        fy_new = float(new_K[1, 1])
-        cx_new = float(new_K[0, 2])
-        cy_new = float(new_K[1, 2])
-        undist_intrinsics[Path(img_path).name] = {
-            'width': int(undist.shape[1]),
-            'height': int(undist.shape[0]),
-            'fx': fx_new, 'fy': fy_new, 'cx': cx_new, 'cy': cy_new,
-            'distortion': {'k1': 0.0, 'k2': 0.0, 'p1': 0.0, 'p2': 0.0, 'k3': 0.0}
-        }
-
-    # write calib for undistorted outputs, preserving original format and extrinsics
-    # We will clone the original calib structure and update camera intrinsics
-    calib_clone = copy.deepcopy(calib)  # More efficient deep copy
-    cams_clone = calib_clone.get('Calibration', {}).get('cameras', [])
-
-    def set_param(params_dict: Dict[str, Any], key: str, val: float):
-        if key in params_dict and isinstance(params_dict[key], dict):
-            # libCalib format: params[key] = { "val": number, ... }
-            params_dict[key]['val'] = float(val)
-        else:
-            # if missing, create it minimally
-            params_dict[key] = {'val': float(val)}
-
-    for i, cam_entry in enumerate(cams_clone):
-        # map camera to corresponding image's new intrinsics when available
-        img_name = None
-        if per_cam and i < len(img_paths):
-            img_name = Path(img_paths[i]).name
-        else:
-            # fallback to first image's intrinsics if counts mismatch
-            img_name = Path(img_paths[0]).name
-
-        new_intr = undist_intrinsics.get(img_name)
-        if not new_intr:
+        # 读取图像获取实际尺寸
+        img = cv2.imread(img_path)
+        if img is None:
+            print(f"  警告: 无法读取 {img_path}")
             continue
-
-        model = cam_entry.get('model', {})
-        data = model.get('ptr_wrapper', {}).get('data', {})
-        params = data.setdefault('parameters', {})
         
-        # If unified intrinsics are used, all cameras get the same intrinsics
-        if args.unify_intrinsics:
-            # Use the unified intrinsics (should be the same for all images)
-            new_fx = new_intr['fx']
-            new_fy = new_intr['fy']
-            new_cx = new_intr['cx'] 
-            new_cy = new_intr['cy']
-        else:
-            # Use individual camera intrinsics
-            new_fx = new_intr['fx']
-            new_fy = new_intr['fy']
-            new_cx = new_intr['cx']
-            new_cy = new_intr['cy']
+        h, w = img.shape[:2]
         
-        new_ar = new_fy / new_fx if new_fx > 0 else 1.0
+        # 如果图像尺寸与标定尺寸不同，缩放内参
+        if w0 > 0 and h0 > 0 and (w != w0 or h != h0):
+            sx, sy = w / w0, h / h0
+            fx, fy = fx * sx, fy * sy
+            cx, cy = cx * sx, cy * sy
         
-        # Update intrinsics parameters - use f + ar format to preserve aspect ratio
-        set_param(params, 'f', new_fx)  # Set f = fx
-        set_param(params, 'ar', new_ar)  # Set ar = fy/fx
-        set_param(params, 'fx', new_fx)
-        set_param(params, 'fy', new_fy)
-        set_param(params, 'cx', new_cx)
-        set_param(params, 'cy', new_cy)
-        # Zero distortion (OpenCV k1,k2,p1,p2,k3)
-        set_param(params, 'k1', 0.0)
-        set_param(params, 'k2', 0.0)
-        set_param(params, 'p1', 0.0)
-        set_param(params, 'p2', 0.0)
-        set_param(params, 'k3', 0.0)
-        # preserve/adjust imageSize if present
-        crt = data.get('CameraModelCRT', {})
-        base = crt.get('CameraModelBase', {})
-        img_size = base.get('imageSize', {})
-        img_size['width'] = int(new_intr['width'])
-        img_size['height'] = int(new_intr['height'])
-        base['imageSize'] = img_size
-        crt['CameraModelBase'] = base
-        data['CameraModelCRT'] = crt
-        model['ptr_wrapper']['data'] = data
-        cam_entry['model'] = model
-
-    out_json = Path(args.output_dir) / 'calib_undistorted.json'
-    with out_json.open('w') as jf:
-        json.dump(calib_clone, jf, indent=2)
-    print(f'Wrote undistorted calib (preserving extrinsics and format) to {out_json}')
-
-    print('Done.')
+        # 提取外参
+        T_w2c = extract_extrinsics(cam_entry)
+        if T_w2c is None:
+            # 如果没有外参，使用单位矩阵
+            T_w2c = np.eye(4)
+        
+        R = T_w2c[:3, :3]
+        t = T_w2c[:3, 3]
+        qw, qx, qy, qz = rotation_matrix_to_quaternion(R)
+        
+        # 复制图像（移除空格）
+        new_name = Path(img_path).name.replace(' ', '')
+        shutil.copy2(img_path, os.path.join(images_input_dir, new_name))
+        
+        cameras_data.append({
+            'id': i + 1,
+            'width': w,
+            'height': h,
+            'fx': fx,
+            'fy': fy,
+            'cx': cx,
+            'cy': cy,
+            'dist': dist,
+            'quaternion': (qw, qx, qy, qz),
+            'translation': (t[0], t[1], t[2]),
+            'image_name': new_name
+        })
+    
+    print(f"  已处理 {len(cameras_data)} 张图像")
+    
+    # 创建COLMAP稀疏模型
+    sparse_dir = create_colmap_sparse(cameras_data, temp_dir)
+    print(f"  已创建COLMAP稀疏模型")
+    
+    # 步骤3: pycolmap去畸变
+    print(f"\n[3/4] 使用pycolmap去畸变...")
+    undistorted_dir = os.path.join(temp_dir, 'undistorted')
+    
+    pycolmap.undistort_images(
+        output_path=undistorted_dir,
+        input_path=sparse_dir,
+        image_path=images_input_dir,
+        output_type="COLMAP"
+    )
+    print(f"  去畸变完成")
+    
+    # 步骤4: 裁剪使主点居中
+    print(f"\n[4/4] 裁剪图像使主点居中...")
+    unified_width, unified_height = center_principal_point(undistorted_dir, args.output_dir)
+    
+    # 清理临时目录
+    print(f"\n清理临时文件...")
+    shutil.rmtree(temp_dir)
+    
+    # 完成
+    print("\n" + "="*60)
+    print("处理完成！")
+    print("="*60)
+    print(f"输出目录: {args.output_dir}")
+    print(f"  - 图像: {os.path.join(args.output_dir, 'images')}")
+    print(f"  - cameras.txt: {os.path.join(args.output_dir, 'sparse', 'cameras.txt')}")
+    print(f"  - images.txt: {os.path.join(args.output_dir, 'sparse', 'images.txt')}")
+    print(f"  - points3D.txt: {os.path.join(args.output_dir, 'sparse', 'points3D.txt')}")
+    print(f"\n图像尺寸: {unified_width} x {unified_height}")
+    print(f"主点位置: ({unified_width/2}, {unified_height/2}) [完全居中]")
+    print(f"相机模型: PINHOLE (无畸变)")
+    print("\n✓ 可直接用于3DGS训练")
+    
+    return 0
 
 
 if __name__ == '__main__':
-    main()
+    exit(main())

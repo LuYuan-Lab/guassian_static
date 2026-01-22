@@ -10,11 +10,7 @@
 5. 导出适用于3DGS训练的图像和更新后的相机参数
 
 使用方法:
-  python undistort_for_3dgs.py \
-    --xml images/2.0/cameras.xml \
-    --images_dir images/2.0/No_Glasses \
-    --output_dir images/2.0/No_Glasses_undistorted_3dgs \
-    --unified_intrinsics False \
+python Convert/xml_undistort_gs_params.py --xml images/all_params/cameras_all_params.xml --images_dir images/2.0/No_Glasses --output_dir images/all_params/ --no_unified_intrinsics
 
 作者: GitHub Copilot
 """
@@ -160,12 +156,13 @@ def build_dist_coeffs(calib: Dict) -> np.ndarray:
 
 
 def compute_valid_roi(K: np.ndarray, dist: np.ndarray, width: int, height: int) -> Tuple[int, int, int, int]:
-    """计算去畸变后的有效区域（无黑边）
+    """计算去畸变后的有效区域（无黑边），确保对称裁切使主点居中
     
     通过采样图像边界上的点，找到去畸变后的有效矩形区域
+    关键：强制对称裁切，确保裁切后主点仍在图像中心
     
     Returns:
-        (x, y, w, h): 有效区域的ROI
+        (x, y, w, h): 有效区域的ROI（对称的）
     """
     # 创建边界上的点
     num_samples = 100
@@ -199,17 +196,22 @@ def compute_valid_roi(K: np.ndarray, dist: np.ndarray, width: int, height: int) 
     left_undist = undist_points[2*num_samples:3*num_samples]
     right_undist = undist_points[3*num_samples:]
     
-    # 计算有效区域边界
-    y_min = max(np.max(top_undist[:, 1]), 0)
-    y_max = min(np.min(bottom_undist[:, 1]), height - 1)
-    x_min = max(np.max(left_undist[:, 0]), 0)
-    x_max = min(np.min(right_undist[:, 0]), width - 1)
+    # 计算各边需要裁切的量
+    left_crop = max(np.max(left_undist[:, 0]) - 0, 0)  # 左边界向内移动的量
+    right_crop = max((width - 1) - np.min(right_undist[:, 0]), 0)  # 右边界向内移动的量
+    top_crop = max(np.max(top_undist[:, 1]) - 0, 0)  # 上边界向内移动的量
+    bottom_crop = max((height - 1) - np.min(bottom_undist[:, 1]), 0)  # 下边界向内移动的量
     
-    # 转换为整数ROI
-    x = int(np.ceil(x_min))
-    y = int(np.ceil(y_min))
-    w = int(np.floor(x_max)) - x
-    h = int(np.floor(y_max)) - y
+    # 关键：对称裁切，取左右最大值，上下最大值
+    # 这确保裁切后主点仍在图像中心
+    horiz_crop = max(left_crop, right_crop)
+    vert_crop = max(top_crop, bottom_crop)
+    
+    # 转换为整数ROI（对称）
+    x = int(np.ceil(horiz_crop))
+    y = int(np.ceil(vert_crop))
+    w = width - 2 * x  # 对称裁切，左右各裁x
+    h = height - 2 * y  # 对称裁切，上下各裁y
     
     # 确保宽高为正
     w = max(w, 1)
@@ -553,9 +555,9 @@ def compute_unified_roi(sensors: List[Dict], width: int, height: int) -> Tuple[i
     """计算所有相机的统一ROI（取最保守的裁切）
     
     这确保所有图像使用相同的裁切区域，保持一致的图像尺寸
+    由于compute_valid_roi已确保对称裁切，这里只需要取最大的x和y
     """
-    min_x, min_y = 0, 0
-    max_w, max_h = width, height
+    max_x, max_y = 0, 0
     
     for sensor in sensors:
         calib = sensor['calibration']
@@ -568,13 +570,15 @@ def compute_unified_roi(sensors: List[Dict], width: int, height: int) -> Tuple[i
         
         x, y, w, h = compute_valid_roi(K, dist, width, height)
         
-        # 取最保守的裁切（最大的裁切量）
-        min_x = max(min_x, x)
-        min_y = max(min_y, y)
-        max_w = min(max_w, w)
-        max_h = min(max_h, h)
+        # 取最大的裁切量（最保守）
+        max_x = max(max_x, x)
+        max_y = max(max_y, y)
     
-    return min_x, min_y, max_w, max_h
+    # 计算最终的对称ROI
+    final_w = width - 2 * max_x
+    final_h = height - 2 * max_y
+    
+    return max_x, max_y, final_w, final_h
 
 
 def main():
@@ -590,12 +594,18 @@ def main():
                         help='输出更新后的XML文件路径（可选）')
     parser.add_argument('--pattern', type=str, default='*.png',
                         help='图像文件匹配模式（默认: *.png）')
-    parser.add_argument('--unified_roi', type=bool, default=True,
-                        help='是否使用统一的ROI裁切所有图像（推荐，默认: True）')
-    parser.add_argument('--unified_intrinsics', type=bool, default=True,
-                        help='是否使用统一的相机内参（True: 1个相机，False: 每图1个相机，默认: True）')
-    parser.add_argument('--export_colmap', type=bool, default=True,
-                        help='是否导出COLMAP格式的相机参数（默认: True）')
+    parser.add_argument('--unified_roi', action='store_true', default=True,
+                        help='使用统一的ROI裁切所有图像（默认启用）')
+    parser.add_argument('--no_unified_roi', action='store_false', dest='unified_roi',
+                        help='禁用统一ROI裁切')
+    parser.add_argument('--unified_intrinsics', action='store_true', default=True,
+                        help='使用统一的相机内参（1个相机，默认启用）')
+    parser.add_argument('--no_unified_intrinsics', action='store_false', dest='unified_intrinsics',
+                        help='每张图像单独的相机内参')
+    parser.add_argument('--export_colmap', action='store_true', default=True,
+                        help='导出COLMAP格式的相机参数（默认启用）')
+    parser.add_argument('--no_export_colmap', action='store_false', dest='export_colmap',
+                        help='不导出COLMAP格式')
     
     args = parser.parse_args()
     
